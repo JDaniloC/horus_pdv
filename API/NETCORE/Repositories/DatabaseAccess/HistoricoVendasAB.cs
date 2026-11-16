@@ -117,9 +117,9 @@ public class HistoricoVendasAB(Connection connection)
                 await using var itemCommand = new SqlCommand(
                     """
                     INSERT INTO VendaItens
-                        (Id, VendaId, ProductCode, ProductName, Quantity, UnitPrice, ItemTotal)
+                        (Id, VendaId, ProductCode, ProductName, Quantity, UnitPrice, UnitCostPrice, ItemTotal)
                     VALUES
-                        (@Id, @VendaId, @ProductCode, @ProductName, @Quantity, @UnitPrice, @ItemTotal);
+                        (@Id, @VendaId, @ProductCode, @ProductName, @Quantity, @UnitPrice, @UnitCostPrice, @ItemTotal);
                     """,
                     db,
                     transaction);
@@ -132,6 +132,7 @@ public class HistoricoVendasAB(Connection connection)
                 qtyParam.Scale = 3;
                 qtyParam.Value = item.Quantity;
                 itemCommand.Parameters.AddWithValue("@UnitPrice", item.UnitPrice);
+                itemCommand.Parameters.AddWithValue("@UnitCostPrice", string.IsNullOrWhiteSpace(item.UnitCostPrice) ? "0,00" : item.UnitCostPrice);
                 itemCommand.Parameters.AddWithValue("@ItemTotal", itemTotalFormatted);
                 await itemCommand.ExecuteNonQueryAsync();
 
@@ -360,6 +361,7 @@ public class HistoricoVendasAB(Connection connection)
             var currentStock = ReadDecimal(reader, "ProductQnt");
             var unitPrice = ReadString(reader, "ProductUnitPrice");
             var salePrice = ReadString(reader, "ProductSalePrice");
+            var unitCostPrice = string.IsNullOrWhiteSpace(unitPrice) ? "0,00" : unitPrice;
             var effectiveUnitPriceText = string.IsNullOrWhiteSpace(salePrice) ? unitPrice : salePrice;
             await reader.CloseAsync();
 
@@ -399,6 +401,7 @@ public class HistoricoVendasAB(Connection connection)
                 ProductCode = productCode,
                 ProductName = productName,
                 UnitPrice = effectiveUnitPriceText,
+                UnitCostPrice = unitCostPrice,
                 Quantity = totalQuantity,
                 FinalItemTotal = finalGroupTotal
             });
@@ -463,6 +466,8 @@ public class HistoricoVendasAB(Connection connection)
     private static async Task EnsurePrintColumnsAsync(SqlConnection db)
     {
         const string schemaSql = """
+            IF COL_LENGTH('Vendas', 'CaixaSessaoId') IS NULL
+                ALTER TABLE Vendas ADD CaixaSessaoId NVARCHAR(40) NULL;
             IF COL_LENGTH('Vendas', 'PaymentType') IS NULL
                 ALTER TABLE Vendas ADD PaymentType NVARCHAR(30) NOT NULL CONSTRAINT DF_Vendas_PaymentType DEFAULT N'-';
             IF COL_LENGTH('Vendas', 'TotalAmount') IS NULL
@@ -471,6 +476,19 @@ public class HistoricoVendasAB(Connection connection)
                 ALTER TABLE Vendas ADD OperatorName NVARCHAR(180) NOT NULL CONSTRAINT DF_Vendas_OperatorName DEFAULT N'Operador';
             IF COL_LENGTH('VendaItens', 'UnitPrice') IS NULL
                 ALTER TABLE VendaItens ADD UnitPrice NVARCHAR(30) NOT NULL CONSTRAINT DF_VendaItens_UnitPrice DEFAULT N'0,00';
+            IF COL_LENGTH('VendaItens', 'UnitCostPrice') IS NULL
+            BEGIN
+                ALTER TABLE VendaItens ADD UnitCostPrice NVARCHAR(30) NOT NULL CONSTRAINT DF_VendaItens_UnitCostPrice DEFAULT N'0,00';
+
+                -- Backfill inicial seguro executado uma única vez na criação da coluna para preservar o snapshot histórico
+                UPDATE i
+                   SET UnitCostPrice = COALESCE(NULLIF(LTRIM(RTRIM(p.ProductUnitPrice)), ''), N'0,00')
+                  FROM VendaItens i
+                  INNER JOIN Vendas v ON v.Id = i.VendaId
+                  INNER JOIN Produtos p ON p.ProductCode = i.ProductCode AND p.CompanyId = v.CompanyId
+                 WHERE NULLIF(LTRIM(RTRIM(i.UnitCostPrice)), '') IS NULL
+                    OR REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(i.UnitCostPrice)), N'R$', N''), N'.', N''), N',', N'.') IN (N'0', N'0.00');
+            END;
             IF COL_LENGTH('VendaItens', 'ItemTotal') IS NULL
                 ALTER TABLE VendaItens ADD ItemTotal NVARCHAR(30) NOT NULL CONSTRAINT DF_VendaItens_ItemTotal DEFAULT N'0,00';
             """;
@@ -479,7 +497,8 @@ public class HistoricoVendasAB(Connection connection)
             UPDATE i
                SET UnitPrice = COALESCE(NULLIF(LTRIM(RTRIM(p.ProductSalePrice)), ''), NULLIF(LTRIM(RTRIM(p.ProductUnitPrice)), ''), N'0,00')
               FROM VendaItens i
-              INNER JOIN Produtos p ON p.ProductCode = i.ProductCode
+              INNER JOIN Vendas v ON v.Id = i.VendaId
+              INNER JOIN Produtos p ON p.ProductCode = i.ProductCode AND p.CompanyId = v.CompanyId
              WHERE NULLIF(LTRIM(RTRIM(i.UnitPrice)), '') IS NULL
                 OR REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(i.UnitPrice)), N'R$', N''), N'.', N''), N',', N'.') IN (N'0', N'0.00');
 
@@ -564,6 +583,7 @@ public class HistoricoVendasAB(Connection connection)
         public string ProductCode { get; set; } = string.Empty;
         public string ProductName { get; set; } = string.Empty;
         public string UnitPrice { get; set; } = string.Empty;
+        public string UnitCostPrice { get; set; } = "0,00";
         public decimal Quantity { get; set; }
         public decimal FinalItemTotal { get; set; }
     }
