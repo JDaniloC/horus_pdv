@@ -31,7 +31,8 @@ export default function LastScannedCard({
     : selectedProduct
       ? selectedProduct.salePrice
       : 0;
-  const displayTotal = displayQty * displayUnitPrice;
+  const displayTotal =
+    activeItem?.itemTotalOverride ?? Math.round(displayQty * displayUnitPrice * 100) / 100;
   const hasActiveProduct = Boolean(activeItem || selectedProduct);
 
   return (

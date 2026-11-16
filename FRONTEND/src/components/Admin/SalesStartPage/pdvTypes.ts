@@ -11,14 +11,17 @@ export type PdvProduct = {
   stock: number;
   salePrice: number;
   imageUrl?: string;
+  unitType?: string;
 };
 
 export type PdvCartItem = {
   id: string;
+  lineId?: string;
   code: string;
   name: string;
   quantity: number;
   unitPrice: number;
+  itemTotalOverride?: number;
 };
 
 export type ProductSubmissionResolution =

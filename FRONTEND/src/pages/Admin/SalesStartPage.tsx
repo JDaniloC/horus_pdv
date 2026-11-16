@@ -62,13 +62,17 @@ import {
   setHighVisibilityEnabled,
   setScannerAutoFocusEnabled,
 } from "@/utils/pdvPreferences";
+import {
+  formatQuantityPtBr,
+  parseScaleBarcode,
+  roundQuantity,
+} from "@/utils/scaleBarcode";
 
 type SalesStartPageProps = {
   onExit?: () => void;
   standalone?: boolean;
   operatorName?: string;
 };
-
 const PAYMENT_OPTIONS: Array<{ value: PaymentType; label: string; shortcut: string }> = [
   { value: "dinheiro", label: "Dinheiro", shortcut: "1" },
   { value: "pix", label: "PIX", shortcut: "2" },
@@ -158,7 +162,7 @@ export default function SalesStartPage({
   standalone = false,
   operatorName = "Operador",
 }: SalesStartPageProps) {
-  const { formatMoneyBr, maskCpf, maskMoneyBr, parseMoneyBr, sanitizeIntegerInput } =
+  const { formatMoneyBr, maskCpf, maskMoneyBr, parseMoneyBr, sanitizeDecimalInput } =
     useInputMasks();
   const statusDialog = useStatusDialog();
   const productInputRef = useRef<HTMLInputElement | null>(null);
@@ -182,7 +186,9 @@ export default function SalesStartPage({
   const [cart, setCart] = useState<PdvCartItem[]>(readPendingCart);
   const [lastScannedItemId, setLastScannedItemId] = useState<string | null>(() => {
     const initialCart = readPendingCart();
-    return initialCart.length > 0 ? initialCart[initialCart.length - 1].id : null;
+    if (initialCart.length === 0) return null;
+    const last = initialCart[initialCart.length - 1];
+    return last.lineId ?? last.id;
   });
   const [displayStatus, setDisplayStatus] = useState<
     "idle" | "active" | "completed" | "cancelled"
@@ -224,9 +230,9 @@ export default function SalesStartPage({
   );
 
   const quantity = useMemo(() => {
-    const parsed = Number(quantityInput);
-    if (!Number.isFinite(parsed) || parsed < 1) return 1;
-    return Math.floor(parsed);
+    const parsed = Number(String(quantityInput).replace(",", "."));
+    if (!Number.isFinite(parsed) || parsed <= 0) return 1;
+    return roundQuantity(parsed) || 1;
   }, [quantityInput]);
 
   const filteredProducts = useMemo(
@@ -235,11 +241,18 @@ export default function SalesStartPage({
   );
 
   const subtotal = useMemo(
-    () => cart.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0),
+    () =>
+      Math.round(
+        cart.reduce(
+          (sum, item) =>
+            sum + (item.itemTotalOverride ?? Math.round(item.unitPrice * item.quantity * 100) / 100),
+          0,
+        ) * 100,
+      ) / 100,
     [cart],
   );
   const totalVolumes = useMemo(
-    () => cart.reduce((sum, item) => sum + item.quantity, 0),
+    () => roundQuantity(cart.reduce((sum, item) => sum + item.quantity, 0)),
     [cart],
   );
 
@@ -249,7 +262,7 @@ export default function SalesStartPage({
   const lastScannedCartItem = useMemo(() => {
     if (cart.length === 0) return null;
     if (lastScannedItemId) {
-      const matched = cart.find((item) => item.id === lastScannedItemId);
+      const matched = cart.find((item) => (item.lineId ?? item.id) === lastScannedItemId);
       if (matched) return matched;
     }
     return cart[cart.length - 1];
@@ -281,9 +294,10 @@ export default function SalesStartPage({
         id: item.id,
         name: item.productName,
         code: item.productCode,
-        stock: Number(item.productQnt || 0),
+        stock: Number(String(item.productQnt || "0").replace(",", ".")),
         salePrice: parseMoneyBr(item.productSalePrice || "0"),
         imageUrl: item.productImageUrl,
+        unitType: item.unitType,
       })),
     );
   }, [parseMoneyBr]);
@@ -454,16 +468,19 @@ export default function SalesStartPage({
   const customerDisplayState = useMemo<CustomerDisplayState>(() => {
     const productImageMap = new Map(products.map((product) => [product.id, product.imageUrl]));
     const mappedItems = cart.map((item) => ({
-      id: item.id,
+      id: item.lineId ?? item.id,
       code: item.code,
       name: item.name,
       quantity: item.quantity,
       unitPrice: item.unitPrice,
-      total: item.quantity * item.unitPrice,
+      total: item.itemTotalOverride ?? Math.round(item.quantity * item.unitPrice * 100) / 100,
       imageUrl: productImageMap.get(item.id),
     }));
-    const mappedLastScanned = lastScannedCartItem
-      ? mappedItems.find((item) => item.id === lastScannedCartItem.id) ?? null
+    const lastLineKey = lastScannedCartItem
+      ? (lastScannedCartItem.lineId ?? lastScannedCartItem.id)
+      : null;
+    const mappedLastScanned = lastLineKey
+      ? mappedItems.find((item) => item.id === lastLineKey) ?? null
       : null;
 
     return {
@@ -580,18 +597,25 @@ export default function SalesStartPage({
 
   const addProductToCart = useCallback(
     (product: PdvProduct, qty: number): boolean => {
-      const existing = cart.find((item) => item.id === product.id);
-      if (qty > product.stock) {
-        Toast.error(`Estoque insuficiente. Disponível: ${product.stock}.`);
+      const normalizedQty = roundQuantity(qty);
+      const currentTotalQty = roundQuantity(
+        cart
+          .filter((item) => item.id === product.id)
+          .reduce((sum, item) => sum + item.quantity, 0),
+      );
+      if (normalizedQty > product.stock) {
+        Toast.error(`Estoque insuficiente. Disponível: ${formatQuantityPtBr(product.stock)}.`);
         return false;
       }
-      if (existing && existing.quantity + qty > product.stock) {
+      if (roundQuantity(currentTotalQty + normalizedQty) > product.stock) {
         Toast.error(`Estoque insuficiente para ${product.name}.`);
         return false;
       }
 
       setCart((current) => {
-        const currentExisting = current.find((item) => item.id === product.id);
+        const currentExisting = current.find(
+          (item) => item.id === product.id && item.itemTotalOverride === undefined,
+        );
         if (!currentExisting) {
           return [
             ...current,
@@ -599,15 +623,14 @@ export default function SalesStartPage({
               id: product.id,
               code: product.code,
               name: product.name,
-              quantity: qty,
+              quantity: normalizedQty,
               unitPrice: product.salePrice,
             },
           ];
         }
+        const nextQuantity = roundQuantity(currentExisting.quantity + normalizedQty);
         return current.map((item) =>
-          item.id === product.id
-            ? { ...item, quantity: currentExisting.quantity + qty }
-            : item,
+          item === currentExisting ? { ...item, quantity: nextQuantity } : item,
         );
       });
 
@@ -627,10 +650,53 @@ export default function SalesStartPage({
   const submitProductEntry = useCallback(
     (rawQuery?: string, options?: { allowFuzzyFallback?: boolean }): boolean => {
       const query = rawQuery ?? productSearch;
+      const trimmedQuery = query.trim();
+      const effectiveSelected = rawQuery ? null : selectedProduct;
+      const scaleMatch = !effectiveSelected ? parseScaleBarcode(trimmedQuery, products) : null;
+      if (scaleMatch) {
+        const existingQty = roundQuantity(
+          cart
+            .filter((item) => item.id === scaleMatch.product.id)
+            .reduce((sum, item) => sum + item.quantity, 0),
+        );
+        if (roundQuantity(existingQty + scaleMatch.quantity) > scaleMatch.product.stock) {
+          Toast.error(
+            `Estoque insuficiente para ${scaleMatch.product.name}. Disponível: ${formatQuantityPtBr(scaleMatch.product.stock)}.`,
+          );
+          setShowProductOptions(false);
+          focusProductInput({ select: true });
+          return false;
+        }
+
+        const scaleLineId = `${scaleMatch.product.id}-scale-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        setCart((current) => [
+          ...current,
+          {
+            id: scaleMatch.product.id,
+            lineId: scaleLineId,
+            code: scaleMatch.product.code,
+            name: scaleMatch.product.name,
+            quantity: scaleMatch.quantity,
+            unitPrice: scaleMatch.unitPrice,
+            itemTotalOverride: scaleMatch.totalValue,
+          },
+        ]);
+
+        setLastScannedItemId(scaleLineId);
+        setDisplayStatus("active");
+        setLastCompletedSale(null);
+        setSelectedProductId("");
+        setProductSearch("");
+        setShowProductOptions(false);
+        setQuantityInput("1");
+        productInputRef.current?.focus();
+        return true;
+      }
+
       const resolution = resolveProductSubmission({
         query,
         products,
-        selectedProduct: rawQuery ? null : selectedProduct,
+        selectedProduct: effectiveSelected,
         showProductOptions: rawQuery ? false : showProductOptions,
         highlightedProductIndex,
         allowFuzzyFallback: options?.allowFuzzyFallback ?? false,
@@ -646,7 +712,7 @@ export default function SalesStartPage({
       }
 
       Toast.error(
-        query.trim()
+        trimmedQuery
           ? "Produto não encontrado para o código informado."
           : "Selecione um produto.",
       );
@@ -656,6 +722,7 @@ export default function SalesStartPage({
     },
     [
       addProductToCart,
+      cart,
       focusProductInput,
       highlightedProductIndex,
       productSearch,
@@ -671,17 +738,16 @@ export default function SalesStartPage({
     submitProductEntry(undefined, { allowFuzzyFallback: true });
   }, [submitProductEntry]);
 
-  const removeItem = (id: string) => {
-    setCart((current) => {
-      const next = current.filter((item) => item.id !== id);
-      if (lastScannedItemId === id) {
-        setLastScannedItemId(next.length > 0 ? next[next.length - 1].id : null);
-      }
-      if (next.length === 0) {
-        setDisplayStatus("idle");
-      }
-      return next;
-    });
+  const removeItem = (lineKey: string) => {
+    const next = cart.filter((item) => (item.lineId ?? item.id) !== lineKey);
+    setCart(next);
+    if (lastScannedItemId === lineKey) {
+      const last = next[next.length - 1];
+      setLastScannedItemId(last ? (last.lineId ?? last.id) : null);
+    }
+    if (next.length === 0) {
+      setDisplayStatus("idle");
+    }
     if (scannerAutoFocusEnabled) {
       focusProductInput();
     }
@@ -837,6 +903,9 @@ export default function SalesStartPage({
           productCode: item.code,
           productName: item.name,
           quantity: item.quantity,
+          ...(item.itemTotalOverride !== undefined
+            ? { itemTotalOverride: item.itemTotalOverride }
+            : {}),
         })),
       });
       const receipt: SaleReceipt = {
@@ -865,7 +934,7 @@ export default function SalesStartPage({
         change: paymentType === "dinheiro" ? changeValue : 0,
         items: cart.map((item) => ({
           ...item,
-          total: item.quantity * item.unitPrice,
+          total: item.itemTotalOverride ?? Math.round(item.quantity * item.unitPrice * 100) / 100,
         })),
       };
 
@@ -1213,14 +1282,19 @@ export default function SalesStartPage({
                 <input
                   ref={qtyInputRef}
                   value={quantityInput}
-                  inputMode="numeric"
-                  pattern="[0-9]*"
+                  inputMode="decimal"
                   onFocus={(event) => event.target.select()}
                   onChange={(event) =>
-                    setQuantityInput(sanitizeIntegerInput(event.target.value).slice(0, 4))
+                    setQuantityInput(sanitizeDecimalInput(event.target.value, 3).slice(0, 10))
                   }
                   onBlur={() => {
-                    if (!quantityInput || Number(quantityInput) < 1) setQuantityInput("1");
+                    const cleaned = quantityInput.replace(/\.$/, "");
+                    const parsed = Number(cleaned.replace(",", "."));
+                    if (!cleaned || !Number.isFinite(parsed) || parsed <= 0) {
+                      setQuantityInput("1");
+                    } else if (cleaned !== quantityInput) {
+                      setQuantityInput(cleaned);
+                    }
                   }}
                   className="input-field pdv-qty-input pdv-tabular h-10 w-full text-lg font-semibold"
                 />
@@ -1300,7 +1374,11 @@ export default function SalesStartPage({
                 <div className="min-h-[180px] flex-1 overflow-auto rounded-xl border border-dashed border-border-secondary bg-bg-primary md:min-h-0">
                   <CartItemsTable
                     cart={cart}
-                    lastScannedItemId={lastScannedCartItem?.id}
+                    lastScannedItemId={
+                      lastScannedCartItem
+                        ? (lastScannedCartItem.lineId ?? lastScannedCartItem.id)
+                        : null
+                    }
                     formatMoney={formatMoneyBr}
                     onRemoveItem={removeItem}
                     highVisibility={highVisibilityEnabled}
